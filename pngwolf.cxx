@@ -39,6 +39,8 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <queue>
+#include <string>
 #include <vector>
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -1401,183 +1403,207 @@ void PngWolf::recompress() {
   done_deflating_at = time(NULL);
 }
 
-bool PngWolf::read_file() {
+/// <summary>
+/// Reads the input file that was set with in_path.
+/// </summary>
+/// <returns>false if the file was read, true if an error occurred.</returns>
+bool PngWolf::read_file()
+{
+    unsigned int iend_chunk_count = 0;
+    
+    // Reset data that doesn't get set in this function except for time measurement.
+    initial_pop = GAPopulation();
+    chunks.clear();
+    original_filters.clear();
+    genomes.clear();
+    best_genomes.clear();
+    original_unfiltered.clear();
+    original_deflated.clear();
+    original_inflated.clear();
+    best_inflated.clear();
+    best_deflated.clear();
+    flt_singles.clear();
+    invis_colors.clear();
+    nth_generation = 0;
+    genomes_evaluated = 0;
 
-  char fileMagic[8];
-  unsigned int iend_chunk_count = 0;
-  size_t expected;
+    try
+    {
+        std::ifstream in;
+        in.exceptions(std::ios::badbit | std::ios::failbit);
+        in.open(in_path, std::ios::binary | std::ios::in);
 
-  std::ifstream in;
-  in.exceptions(std::ios::badbit | std::ios::failbit);
-  in.open(in_path, std::ios::binary | std::ios::in);
-  in.read(fileMagic, 8);
+        char fileMagic[8];
+        in.read(fileMagic, 8);
+        if (memcmp(fileMagic, PNG_MAGIC, 8) != 0)
+            return true;
 
-  if (memcmp(fileMagic, PNG_MAGIC, 8) != 0)
-    goto error;
+        while (!in.eof())
+        {
+            PngChunk chunk;
 
-  while (!in.eof()) {
-    PngChunk chunk;
+            in.read((char*)&chunk.size, sizeof(chunk.size));
+            chunk.size = ntohl(chunk.size);
 
-    in.read((char*)&chunk.size, sizeof(chunk.size));
-    chunk.size = ntohl(chunk.size);
+            in.read((char*)&chunk.type, sizeof(chunk.type));
+            chunk.type = ntohl(chunk.type);
 
-    in.read((char*)&chunk.type, sizeof(chunk.type));
-    chunk.type = ntohl(chunk.type);
+            if (chunk.size > 0)
+            {
+                chunk.data.resize(chunk.size);
+                in.read((char*)&chunk.data[0], chunk.size);
+            }
 
-    if (chunk.size > 0) {
-      chunk.data.resize(chunk.size);
-      in.read((char*)&chunk.data[0], chunk.size);
+            in.read((char*)&chunk.crc32, sizeof(chunk.crc32));
+
+            chunk.crc32 = ntohl(chunk.crc32);
+
+            // IHDR
+            if (chunk.type == IHDR_TYPE && chunk.size == 13)
+            {
+                // TODO: This does not check that this is the first and only
+                // IHDR chunk in the file even though only one IHDR is allowed.
+
+                memcpy(&ihdr.width, &chunk.data.at(0), sizeof(ihdr.width));
+                ihdr.width = ntohl(ihdr.width);
+
+                memcpy(&ihdr.height, &chunk.data.at(4), sizeof(ihdr.height));
+                ihdr.height = ntohl(ihdr.height);
+
+                ihdr.depth = chunk.data.at(8);
+                ihdr.color = chunk.data.at(9);
+                ihdr.comp = chunk.data.at(10);
+                ihdr.filter = chunk.data.at(11);
+                ihdr.interlace = chunk.data.at(12);
+            }
+
+            // IDAT
+            if (chunk.type == IDAT_TYPE)
+                original_deflated.insert(original_deflated.end(), chunk.data.begin(), chunk.data.end());
+
+            // IEND
+            if (chunk.type == IEND_TYPE)
+                iend_chunk_count++;
+
+            chunks.push_back(chunk);
+
+            // Peek so the eof check works as expected.
+            in.peek();
+        }
+
+        in.close();
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "An error occurred: " << e.what() << '\n';
+        return true;
     }
 
-    in.read((char*)&chunk.crc32, sizeof(chunk.crc32));
+    // We can't do anything if there is no image data in the input.
+    if (original_deflated.size() == 0)
+        return true;
 
-    chunk.crc32 = ntohl(chunk.crc32);
+    // For simplicity, we rely on the image having only exactly one
+    // IEND chunk (as mandated by the specification) so inserting a
+    // new IDAT chunk is simple. Note that there are other possible
+    // errors with the chunk arrangement that are not checked for,
+    // but the worst that would happen is that a broken image is re-
+    // written into a new similarily broken image, which is fine.
+    if (iend_chunk_count != 1)
+        return true;
 
-    // IHDR
-    if (chunk.type == IHDR_TYPE && chunk.size == 13) {
+    // PNG does not allow images with zero height or width, and at
+    // the time of writing, only filter mode zero was permitted.
+    if (ihdr.width == 0 || ihdr.height == 0 || ihdr.filter != 0)
+        return true;
 
-      // TODO: This does not check that this is the first and only
-      // IHDR chunk in the file even though only one IHDR is allowed.
+    // At the time of writing, compression level zero was the only
+    // valid one, and color modes could not exceed six; interlaced
+    // images are not supported, mainly because the author did not
+    // bother to implement Adam7 when the goal is to minimize size.
+    // Futher checks on the color mode are performed later. TODO:
+    // since interlaced images are not supported, that may merit a
+    // specific error message pointing that design decision out.
+    if (ihdr.comp != 0 || ihdr.interlace != 0 || ihdr.color > 6)
+        return true;
 
-      memcpy(&ihdr.width, &chunk.data.at(0), sizeof(ihdr.width));
-      ihdr.width = ntohl(ihdr.width);
+    // PNG does not allow bit depths below one or above 16
+    if (ihdr.depth == 0 || ihdr.depth > 16)
+        return true;
 
-      memcpy(&ihdr.height, &chunk.data.at(4), sizeof(ihdr.height));
-      ihdr.height = ntohl(ihdr.height);
+    // PNG bit depths must be a power of two
+    if ((ihdr.depth - 1) & ihdr.depth)
+        return true;
 
-      ihdr.depth = chunk.data.at(8);
-      ihdr.color = chunk.data.at(9);
-      ihdr.comp = chunk.data.at(10);
-      ihdr.filter = chunk.data.at(11);
-      ihdr.interlace = chunk.data.at(12);
-    }
+    static const uint32_t channel_map[] = { 1, 0, 3, 1, 2, 0, 4 };
 
-    // IDAT
-    if (chunk.type == IDAT_TYPE)
-      original_deflated.insert(original_deflated.end(),
-        chunk.data.begin(), chunk.data.end());
+    // This validates generally permissable color modes. It does not
+    // fully check whether the combination of bith depth and color
+    // mode is permitted by the specification. TODO: Maybe it should.
+    if (channel_map[ihdr.color] < 1)
+        return true;
 
-    // IEND
-    if (chunk.type == IEND_TYPE)
-      iend_chunk_count++;
+    original_inflated = inflate_zlib(original_deflated);
 
-    chunks.push_back(chunk);
+    size_t expected = ihdr.height * int(ceil(float(((ihdr.width * channel_map[ihdr.color] * ihdr.depth + 8) / 8.0f))));
+    if (expected != original_inflated.size())
+        return true;
 
-    // Peek so the eof check works as expected.
-    in.peek();
-  }
-
-  in.close();
-
-  // We can't do anything if there is no image data in the input.
-  if (original_deflated.size() == 0)
-    goto error;
-
-  // For simplicity, we rely on the image having only exactly one
-  // IEND chunk (as mandated by the specification) so inserting a
-  // new IDAT chunk is simple. Note that there are other possible
-  // errors with the chunk arrangement that are not checked for,
-  // but the worst that would happen is that a broken image is re-
-  // written into a new similarily broken image, which is fine.
-  if (iend_chunk_count != 1)
-    goto error;
-
-  // PNG does not allow images with zero height or width, and at
-  // the time of writing, only filter mode zero was permitted.
-  if (ihdr.width == 0 || ihdr.height == 0 || ihdr.filter != 0)
-    goto error;
-
-  // At the time of writing, compression level zero was the only
-  // valid one, and color modes could not exceed six; interlaced
-  // images are not supported, mainly because the author did not
-  // bother to implement Adam7 when the goal is to minimize size.
-  // Futher checks on the color mode are performed later. TODO:
-  // since interlaced images are not supported, that may merit a
-  // specific error message pointing that design decision out.
-  if (ihdr.comp != 0 || ihdr.interlace != 0 || ihdr.color > 6)
-    goto error;
-
-  // PNG does not allow bit depths below one or above 16
-  if (ihdr.depth == 0 || ihdr.depth > 16)
-    goto error;
-
-  // PNG bit depths must be a power of two
-  if ((ihdr.depth - 1) & ihdr.depth)
-    goto error;
-
-  static const uint32_t channel_map[] = {
-    1, 0, 3, 1, 2, 0, 4
-  };
-
-  // This validates generally permissable color modes. It does not
-  // fully check whether the combination of bith depth and color
-  // mode is permitted by the specification. TODO: Maybe it should.
-  if (channel_map[ihdr.color] < 1)
-    goto error;
-
-  original_inflated = inflate_zlib(original_deflated);
-
-  expected = ihdr.height * int(ceil(
-    float(((ihdr.width * channel_map[ihdr.color] * ihdr.depth + 8) / 8.0f))
-  ));
-
-  if (expected != original_inflated.size())
-    goto error;
-
-  scanline_width = expected / ihdr.height;
-  scanline_delta = channel_map[ihdr.color] *
+    scanline_width = expected / ihdr.height;
+    scanline_delta = channel_map[ihdr.color] *
     int(ceil(float(ihdr.depth / 8.0)));
 
-  for (size_t ix = 0; ix < ihdr.height; ++ix) {
-    unsigned char filter = original_inflated.at(ix * scanline_width);
+    for (size_t ix = 0; ix < ihdr.height; ++ix)
+    {
+        unsigned char filter = original_inflated.at(ix * scanline_width);
 
-    // Abort when the image uses an unsupported filter type
-    if (filter > 4)
-      goto error;
+        // Abort when the image uses an unsupported filter type
+        if (filter > 4)
+            return true;
 
-    original_filters.push_back((PngFilter)filter);
-  }
+        original_filters.push_back((PngFilter)filter);
+    }
 
-  // TODO: copy properly here
-  original_unfiltered.resize(original_inflated.size());
-  memcpy(original_unfiltered.data(),
+    // TODO: copy properly here
+    original_unfiltered.resize(original_inflated.size());
+    memcpy(original_unfiltered.data(),
     original_inflated.data(), original_inflated.size());
 
-  unfilter_idat(original_unfiltered.data(),
+    unfilter_idat(original_unfiltered.data(),
     ihdr.height, scanline_delta, scanline_width);
 
-  // Creates a histogram of the fully transparent pixels in the
-  // image. It is apparently common for graphics programs to
-  // keep the color values of fully transparent pixels around,
-  // but this is rarely desired and makes compression harder, so
-  // we tell users about that and offer to normalize the pixels.
+    // Creates a histogram of the fully transparent pixels in the
+    // image. It is apparently common for graphics programs to
+    // keep the color values of fully transparent pixels around,
+    // but this is rarely desired and makes compression harder, so
+    // we tell users about that and offer to normalize the pixels.
 
-  // TODO: Now that it is modified, original_unfiltered is the
-  // wrong name for the attribute.
+    // TODO: Now that it is modified, original_unfiltered is the
+    // wrong name for the attribute.
 
-  if (ihdr.color == 6 && ihdr.depth == 8) {
-    uint32_t pixel;
-    uint32_t zero = 0;
-    for (uint32_t row = 0; row < ihdr.height; ++row) {
-      for (uint32_t col = 1; col < scanline_width; col += 4) {
-        size_t pos = row * scanline_width + col;
+    if (ihdr.color == 6 && ihdr.depth == 8)
+    {
+        uint32_t pixel;
+        uint32_t zero = 0;
+        for (uint32_t row = 0; row < ihdr.height; ++row)
+        {
+            for (uint32_t col = 1; col < scanline_width; col += 4)
+            {
+                size_t pos = row * scanline_width + col;
 
-        if (original_unfiltered[pos + 3] != 0)
-          continue;
+                if (original_unfiltered[pos + 3] != 0)
+                    continue;
 
-        memcpy(&pixel, &original_unfiltered[pos], 4);
-        invis_colors[pixel]++;
+                memcpy(&pixel, &original_unfiltered[pos], 4);
+                invis_colors[pixel]++;
 
-        if (normalize_alpha)
-          memcpy(&original_unfiltered[pos], &zero, 4);
-      }
+                if (normalize_alpha)
+                    memcpy(&original_unfiltered[pos], &zero, 4);
+            }
+        }
     }
-  }
 
-  return false;
-
-error:
-  return true;
+    return false;
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -1834,10 +1860,8 @@ std::unique_ptr<Deflater> get_deflater_from_option(const std::string& s) {
 void show_help(void) {
   fprintf(stdout, "%s",
     " -----------------------------------------------------------------------------\n"
-    " Usage: pngwolf --in=file.png --out=file.png                                  \n"
+      " Usage: pngwolf <file.png> [...] [options]                                  \n"
     " -----------------------------------------------------------------------------\n"
-    "  --in=<path.png>                The PNG input image                          \n"
-    "  --out=<path.png>               The PNG output file (defaults to not saving!)\n"
     "  --original-idat-to=<path.gz>   Save original IDAT data in a gzip container  \n"
     "  --best-idat-to=<path.gz>       Save best IDAT data in a gzip container      \n"
     "  --out-deflate=<name[,opt..]>   Lib for output (libdeflate, zlib, zopfli)    \n"
@@ -1871,7 +1895,6 @@ void show_help(void) {
     "  --even-if-bigger               Otherwise the original is copied if it's best\n"
     "  --bigger-is-better             Find filter sequences that compress worse    \n"
     "  --info                         Just print out verbose analysis and exit     \n"
-    "  --help                         Print this help page and exit                \n"
     "  --version                      Print version number and exit                \n"
     "                                                                              \n"
     "The names of the estimator and output deflate libraries can optionally be     \n"
@@ -1927,312 +1950,404 @@ void show_version(void) {
 ////////////////////////////////////////////////////////////////////
 // main
 ////////////////////////////////////////////////////////////////////
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
+    bool argVerboseAnalysis = false;
+    bool argVerboseSummary = false;
+    bool argVerboseGenomes = false;
+    bool argExcludeSingles = false;
+    bool argExcludeOriginal = false;
+    bool argExcludeHeuristic = false;
+    bool argExcludeExperiment1 = false;
+    bool argExcludeExperiment2 = false;
+    bool argExcludeExperiment3 = false;
+    bool argExcludeExperiment4 = false;
+    bool argInfo = false;
+    bool argNormalizeAlpha = false;
+    bool argEvenIfBigger = false;
+    bool argAutoMpass = false;
+    bool argBiggerIsBetter = false;
+    int argMaxTime = 0;
+    int argMaxStagnateTime = 5;
+    int argMaxEvaluations = 0;
+    int argMaxDeflate = 0;
+    int argPopulationSize = 19;
+    std::unique_ptr<Deflater> argOutDeflate;
+    std::unique_ptr<Deflater> argEstimator;
+    int argZlibLevel = 7;
+    std::vector<uint32_t> argStripChunks;
+    bool argStripOptional = false;
+    std::vector<uint32_t> argKeepChunks;
 
-  bool argVerboseAnalysis = false;
-  bool argVerboseSummary = false;
-  bool argVerboseGenomes = false;
-  bool argExcludeSingles = false;
-  bool argExcludeOriginal = false;
-  bool argExcludeHeuristic = false;
-  bool argExcludeExperiment1 = false;
-  bool argExcludeExperiment2 = false;
-  bool argExcludeExperiment3 = false;
-  bool argExcludeExperiment4 = false;
-  bool argInfo = false;
-  bool argNormalizeAlpha = false;
-  bool argEvenIfBigger = false;
-  bool argAutoMpass = false;
-  bool argBiggerIsBetter = false;
-  const char* argPng = NULL;
-  const char* argOut = NULL;
-  const char* argBestIdatTo = NULL;
-  const char* argOriginalIdatTo = NULL;
-  int argMaxTime = 0;
-  int argMaxStagnateTime = 5;
-  int argMaxEvaluations = 0;
-  int argMaxDeflate = 0;
-  int argPopulationSize = 19;
-  std::unique_ptr<Deflater> argOutDeflate;
-  std::unique_ptr<Deflater> argEstimator;
-  int argZlibLevel = 7;
-  std::vector<uint32_t> argStripChunks;
-  bool argStripOptional = false;
-  std::vector<uint32_t> argKeepChunks;
+    std::string argPng;
+    std::string argOut;
+    std::string argBestIdatTo;
+    std::string argOriginalIdatTo;
 
 #if !defined(_MSC_VER) && !defined(__MINGW32__)
-  sig_t old_handler;
+    sig_t old_handler;
 #endif
 
-  // Parse command line parameters
-  for (int ax = 1; ax < argc; ++ax) {
-    size_t nlen;
+    std::queue<std::string> fileQueue;
 
-    const char* s = argv[ax];
-    const char* value;
+    // Parse command line parameters looking for filenames. If there is at least one filename, the program starts
+    // a queue of filenames to process. Filenames must come before options, break if any options are being set.
+    int i = 1;
+    while (i < argc)
+    {
+        std::string s = argv[i];
+        if (s.length() >= 3)
+        {
+            if (s[0] != '-' || s[1] != '-')
+                fileQueue.push(s);
+            else
+                break;
+        }
+        else
+        {
+	        fprintf(stderr, "pngwolf: Invalid parameter '%s'\n", s.c_str());
+	        return EXIT_FAILURE;
+        }
 
-    // boolean options
-    if (strcmp("--help", s) == 0) {
-      show_help();
-      return EXIT_SUCCESS;
-
-    } else if (strcmp("--verbose-analysis", s) == 0) {
-      argVerboseAnalysis = true;
-      continue;
-
-    } else if (strcmp("--verbose-summary", s) == 0) {
-      argVerboseSummary = true;
-      continue;
-
-    } else if (strcmp("--verbose-genomes", s) == 0) {
-      argVerboseGenomes = true;
-      continue;
-
-    } else if (strcmp("--exclude-original", s) == 0) {
-      argExcludeOriginal = true;
-      continue;
-
-    } else if (strcmp("--exclude-singles", s) == 0) {
-      argExcludeSingles = true;
-      continue;
-
-    } else if (strcmp("--exclude-heuristic", s) == 0) {
-      argExcludeHeuristic = true;
-      continue;
-
-    } else if (strcmp("--verbose", s) == 0) {
-      argVerboseAnalysis = true;
-      argVerboseSummary = true;
-      argVerboseGenomes = true;
-      continue;
-
-    } else if (strcmp("--info", s) == 0) {
-      argInfo = true;
-      argVerboseAnalysis = true;
-      continue;
-
-    } else if (strcmp("--normalize-alpha", s) == 0) {
-      argNormalizeAlpha = true;
-      continue;
-
-    } else if (strcmp("--even-if-bigger", s) == 0) {
-      argEvenIfBigger = true;
-      continue;
-
-    } else if (strcmp("--bigger-is-better", s) == 0) {
-      argBiggerIsBetter = true;
-      continue;
-
-    } else if (strcmp("--exclude-experiments", s) == 0) {
-      argExcludeExperiment1 = true;
-      argExcludeExperiment2 = true;
-      argExcludeExperiment3 = true;
-      argExcludeExperiment4 = true;
-      continue;
-
-    } else if (strcmp("--strip-optional", s) == 0) {
-      argStripOptional = true;
-      continue;
-
-    } else if (strcmp("--version", s) == 0) {
-      show_version();
-      return EXIT_SUCCESS;
-
+        i++;
     }
 
-    value = strchr(s, '=');
-
-    if (value == NULL) {
-      fprintf(stderr, "pngwolf: option error '%s'", s);
-      return EXIT_FAILURE;
+    // If there are no filenames, the program will show the help message and exit.
+    if (fileQueue.empty())
+    {
+        fprintf(stdout, "pngwolf: No input file specified\n");
+        show_help();
+        return EXIT_SUCCESS;
     }
 
-    nlen = value++ - s;
+    // Continue to parse command line parameters looking for options.
+    while (i < argc)
+    {
+        std::string s = argv[i];
 
-    // --name=value options
-    if (strncmp("--in", s, nlen) == 0) {
-      argPng = value;
+        // Simple options
+        if (s.compare("--verbose-analysis") == 0)
+        {
+            argVerboseAnalysis = true;
+            continue;
+        }
+        else if (s.compare("--verbose-summary") == 0)
+        {
+            argVerboseSummary = true;
+            continue;
+        }
+        else if (s.compare("--verbose-genomes") == 0)
+        {
+            argVerboseGenomes = true;
+            continue;
+        }
+        else if (s.compare("--exclude-original") == 0)
+        {
+            argExcludeOriginal = true;
+            continue;
+        }
+        else if (s.compare("--exclude-singles") == 0)
+        {
+            argExcludeSingles = true;
+            continue;
+        }
+        else if (s.compare("--exclude-heuristic") == 0)
+        {
+            argExcludeHeuristic = true;
+            continue;
+        }
+        else if (s.compare("--verbose") == 0)
+        {
+            argVerboseAnalysis = true;
+            argVerboseSummary = true;
+            argVerboseGenomes = true;
+            continue;
+        }
+        else if (s.compare("--info") == 0)
+        {
+            argInfo = true;
+            argVerboseAnalysis = true;
+            continue;
+        }
+        else if (s.compare("--normalize-alpha") == 0)
+        {
+            argNormalizeAlpha = true;
+            continue;
+        }
+        else if (s.compare("--even-if-bigger") == 0)
+        {
+            argEvenIfBigger = true;
+            continue;
+        }
+        else if (s.compare("--bigger-is-better") == 0)
+        {
+            argBiggerIsBetter = true;
+            continue;
+        }
+        else if (s.compare("--exclude-experiments") == 0)
+        {
+            argExcludeExperiment1 = true;
+            argExcludeExperiment2 = true;
+            argExcludeExperiment3 = true;
+            argExcludeExperiment4 = true;
+            continue;
+        }
+        else if (s.compare("--strip-optional") == 0)
+        {
+            argStripOptional = true;
+            continue;
+        }
+        else if (s.compare("--version") == 0)
+        {
+            show_version();
+            return EXIT_SUCCESS;
+        }
 
-    } else if (strncmp("--out", s, nlen) == 0) {
-      argOut = value;
+        // Assuming value options, get the name of the option and the value after the '=' character.
+        size_t nlen = s.find('=');
+        if (nlen == std::string::npos)
+		{
+            if (nlen + 1 == s.length())
+				fprintf(stderr, "pngwolf: Invalid option '%s'", s.c_str());
+            else
+                fprintf(stderr, "pngwolf: Unknown option '%s'", s.c_str());
+			return EXIT_FAILURE;
+		}
+        std::string value = s.substr(nlen + 1);
 
-    } else if (strncmp("--best-idat-to", s, nlen) == 0) {
-      argBestIdatTo = value;
+        // Value options
+        if (s.compare(0, nlen, "--best-idat-to") == 0)
+        {
+            if (fileQueue.size() > 1)
+			{
+				fprintf(stderr, "pngwolf: Cannot save IDAT when more than one input file is specified\n");
+				return EXIT_FAILURE;
+			}
 
-    } else if (strncmp("--original-idat-to", s, nlen) == 0) {
-      argOriginalIdatTo = value;
+            argBestIdatTo = value;
+        }
+        else if (s.compare(0, nlen, "--original-idat-to") == 0)
+        {
+            if (fileQueue.size() > 1)
+            {
+                fprintf(stderr, "pngwolf: Cannot save IDAT when more than one input file is specified\n");
+                return EXIT_FAILURE;
+            }
 
-    } else if (strncmp("--out-deflate", s, nlen) == 0) {
-      argOutDeflate = get_deflater_from_option(value);
-      if (argOutDeflate == nullptr) {
-        return EXIT_FAILURE;
-      }
+            argOriginalIdatTo = value;
+        }
+        else if (s.compare(0, nlen, "--out-deflate") == 0)
+        {
+            argOutDeflate = get_deflater_from_option(value);
+            if (argOutDeflate == nullptr)
+                return EXIT_FAILURE;
+        }
+        else if (s.compare(0, nlen, "--estimator") == 0)
+        {
+            argEstimator = get_deflater_from_option(value);
+            if (argEstimator == nullptr)
+                return EXIT_FAILURE;
+        }
+        else if (s.compare(0, nlen, "--max-time") == 0)
+        {
+            argMaxTime = stoi(value);
+        }
+        else if (s.compare(0, nlen, "--max-stagnate-time") == 0)
+        {
+            argMaxStagnateTime = stoi(value);
+        }
+        else if (s.compare(0, nlen, "--max-deflate") == 0)
+        {
+            argMaxDeflate = stoi(value);
+        }
+        else if (s.compare(0, nlen, "--max-evaluations") == 0)
+        {
+            argMaxEvaluations = stoi(value);
+        }
+        else if (s.compare(0, nlen, "--population-size") == 0)
+        {
+            argPopulationSize = stoi(value);
+        }
+        else if (s.compare(0, nlen, "--zlib-level") == 0)
+        {
+            argZlibLevel = stoi(value);
+            if (argZlibLevel < 0 || argZlibLevel > 9)
+            {
+                fprintf(stderr, "pngwolf: Invalid zlib level '%d'\n", argZlibLevel);
+                return EXIT_FAILURE;
+            }
+        }
+        else if (s.compare(0, nlen, "--strip-chunk") == 0)
+        {
+            if (value.length() == 4)
+            {
+                argStripChunks.push_back(ntohl(*reinterpret_cast<const uint32_t*>(value.data())));
+            }
+            else
+            {
+                fprintf(stderr, "pngwolf: Invalid chunk name '%s'\n", value.c_str());
+                return EXIT_FAILURE;
+            }
+        }
+        else if (s.compare(0, nlen, "--keep-chunk") == 0)
+        {
+            if (value.length() == 4)
+            {
+                argKeepChunks.push_back(ntohl(*reinterpret_cast<const uint32_t*>(value.data())));
+            }
+            else
+            {
+                fprintf(stderr, "pngwolf: Invalid chunk name '%s'\n", value.c_str());
+                return EXIT_FAILURE;
+            }
+        }
+        else
+        {
+            fprintf(stderr, "pngwolf: Unknown option '%s'", s.c_str());
+            return EXIT_FAILURE;
+        }
 
-    } else if (strncmp("--estimator", s, nlen) == 0) {
-      argEstimator = get_deflater_from_option(value);
-      if (argEstimator == nullptr) {
-        return EXIT_FAILURE;
-      }
-
-    } else if (strncmp("--max-time", s, nlen) == 0) {
-      argMaxTime = atoi(value);
-
-    } else if (strncmp("--max-stagnate-time", s, nlen) == 0) {
-      argMaxStagnateTime = atoi(value);
-
-    } else if (strncmp("--max-deflate", s, nlen) == 0) {
-      argMaxDeflate = atoi(value);
-
-    } else if (strncmp("--max-evaluations", s, nlen) == 0) {
-      argMaxEvaluations = atoi(value);
-
-    } else if (strncmp("--population-size", s, nlen) == 0) {
-      argPopulationSize = atoi(value);
-
-    } else if (strncmp("--zlib-level", s, nlen) == 0) {
-      argZlibLevel = atoi(value);
-
-      if (argZlibLevel < 0 || argZlibLevel > 9) {
-        fprintf(stderr, "pngwolf: invalid zlib level %d\n", argZlibLevel);
-        return EXIT_FAILURE;
-      }
-
-    } else if (strncmp("--strip-chunk", s, nlen) == 0) {
-      if (strlen(value) == 4) {
-        argStripChunks.push_back(ntohl(*(uint32_t *)value));
-      } else {
-        fprintf(stderr, "pngwolf: invalid chunk name '%s'\n", value);
-        return EXIT_FAILURE;
-      }
-
-    } else if (strncmp("--keep-chunk", s, nlen) == 0) {
-      if (strlen(value) == 4) {
-        argKeepChunks.push_back(ntohl(*(uint32_t *)value));
-      } else {
-        fprintf(stderr, "pngwolf: invalid chunk name '%s'\n", value);
-        return EXIT_FAILURE;
-      }
-
-    } else {
-      fprintf(stderr, "pngwolf: unknown option '%s'", s);
-      return EXIT_FAILURE;
+        ++i;
     }
-  }
 
-  if (argPng == NULL) {
-    fprintf(stderr, "pngwolf: missing input file\n"
-                    "Try `pngwolf --help` for more information.\n");
-    return EXIT_FAILURE;
-  }
+    // If OutDeflate or Estimator haven't been set, set them to default values.
+    if (argOutDeflate == nullptr)
+        argOutDeflate = std::make_unique<DeflateZopfli>();
+    if (argEstimator == nullptr)
+        argEstimator = std::make_unique<DeflateLibdeflate>();
 
-  if (argEstimator == nullptr) {
-    argEstimator = std::make_unique<DeflateLibdeflate>();
-  }
+    // Assign all options to the wolf object.
+    wolf.deflate_estimator = std::move(argEstimator);
+    wolf.deflate_out = std::move(argOutDeflate);
+    wolf.zlib_level = argZlibLevel;
+    wolf.max_deflate = argMaxDeflate;
+    wolf.max_evaluations = argMaxEvaluations;
+    wolf.verbose_analysis = argVerboseAnalysis;
+    wolf.verbose_genomes = argVerboseGenomes;
+    wolf.verbose_summary = argVerboseSummary;
+    wolf.exclude_heuristic = argExcludeHeuristic;
+    wolf.exclude_original = argExcludeOriginal;
+    wolf.exclude_singles = argExcludeSingles;
+    wolf.exclude_experiment1 = argExcludeExperiment1;
+    wolf.exclude_experiment2 = argExcludeExperiment2;
+    wolf.exclude_experiment3 = argExcludeExperiment3;
+    wolf.exclude_experiment4 = argExcludeExperiment4;
+    wolf.population_size = argPopulationSize;
+    wolf.max_stagnate_time = argMaxStagnateTime;
+    wolf.max_time = argMaxTime;
+    wolf.normalize_alpha = argNormalizeAlpha;
+    wolf.even_if_bigger = argEvenIfBigger;
+    wolf.auto_mpass = argAutoMpass;
+    wolf.bigger_is_better = argBiggerIsBetter;
+    wolf.strip_chunks = argStripChunks;
+    wolf.strip_optional = argStripOptional;
+    wolf.keep_chunks = argKeepChunks;
+    wolf.program_begun_at = time(nullptr);
+    wolf.last_step_at = time(nullptr);
+    wolf.last_improvement_at = time(nullptr);
 
-  if (argOutDeflate == nullptr) {
-    argOutDeflate = std::make_unique<DeflateZopfli>();
-  }
-
-  wolf.deflate_estimator = std::move(argEstimator);
-  wolf.deflate_out = std::move(argOutDeflate);
-  wolf.zlib_level = argZlibLevel;
-  wolf.in_path = argPng;
-  wolf.max_deflate = argMaxDeflate;
-  wolf.max_evaluations = argMaxEvaluations;
-  wolf.verbose_analysis = argVerboseAnalysis;
-  wolf.verbose_genomes = argVerboseGenomes;
-  wolf.verbose_summary = argVerboseSummary;
-  wolf.exclude_heuristic = argExcludeHeuristic;
-  wolf.exclude_original = argExcludeOriginal;
-  wolf.exclude_singles = argExcludeSingles;
-  wolf.exclude_experiment1 = argExcludeExperiment1;
-  wolf.exclude_experiment2 = argExcludeExperiment2;
-  wolf.exclude_experiment3 = argExcludeExperiment3;
-  wolf.exclude_experiment4 = argExcludeExperiment4;
-  wolf.population_size = argPopulationSize;
-  wolf.max_stagnate_time = argMaxStagnateTime;
-  wolf.last_step_at = time(NULL);
-  wolf.last_improvement_at = time(NULL);
-  wolf.program_begun_at = time(NULL);
-  wolf.max_time = argMaxTime;
-  wolf.out_path = argOut;
-  wolf.normalize_alpha = argNormalizeAlpha;
-  wolf.even_if_bigger = argEvenIfBigger;
-  wolf.auto_mpass = argAutoMpass;
-  wolf.bigger_is_better = argBiggerIsBetter;
-  wolf.strip_chunks = argStripChunks;
-  wolf.strip_optional = argStripOptional;
-  wolf.keep_chunks = argKeepChunks;
-
-  // TODO: ...
-  try {
-    if (wolf.read_file()) {
-      goto error;
+    // Get the exectuable's directory to use as the working directory.
+    std::string executablePath = argv[0];
+    std::size_t pos = executablePath.find_last_of("/");
+    if (pos != std::string::npos)
+    {
+        executablePath = executablePath.substr(0, pos + 1);
     }
-  } catch (...) {
-    goto error;
-  }
+    else
+    {
+        pos = executablePath.find_last_of("\\");
+        if (pos != std::string::npos)
+            executablePath = executablePath.substr(0, pos + 1);
+        else
+            executablePath = "";
+    }
 
-  if (argOriginalIdatTo != NULL)
-    if (wolf.save_original_idat(argOriginalIdatTo))
-      goto out_error;
+    // Foreach file in queue, process the file.
+    while (!fileQueue.empty())
+    {
+        wolf.in_path = fileQueue.front().c_str();
+        if (wolf.read_file()) // True if an error occurred while reading the file.
+        {
+            if (wolf.ihdr.interlace)
+                fprintf(stderr, "pngwolf: Interlaced images are not supported");
+            else
+                fprintf(stderr, "pngwolf: Unable to read input file '%s'", fileQueue.front().c_str());
+            return EXIT_FAILURE;
+        }
+        wolf.in_path = nullptr;
 
-  wolf.init_filters();
-  wolf.log_analysis();
+        if (!argOriginalIdatTo.empty() && wolf.save_original_idat(argOriginalIdatTo.c_str()))
+        {
+            fprintf(stderr, "pngwolf: Unable to save original IDAT file '%s'", argOriginalIdatTo.c_str());
+            return EXIT_FAILURE;
+        }
 
-  if (argInfo)
-    goto done;
+        wolf.init_filters();
+        wolf.log_analysis();
 
-  wolf.search_begun_at = time(NULL);
+        // When the --info option is set, the program will only show the verbose analysis without running experiment.
+        if (argInfo)
+            continue;
+
+        wolf.search_begun_at = time(NULL);
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
-  SetConsoleCtrlHandler(console_event_handler, TRUE);
+        SetConsoleCtrlHandler(console_event_handler, TRUE);
 #else
-  old_handler = signal(SIGINT, sigint_handler);
+        old_handler = signal(SIGINT, sigint_handler);
 #endif
 
-  wolf.run();
+        wolf.run();
 
-  // Uninstall the SIGINT interceptor to allow users to abort
-  // the possibly very slow recompression step. This may lead
-  // to users unintentionally hit CTRL+C twice, but there is
-  // not much to avoid that, other than setting a timer with
-  // some grace perdiod which strikes me as too complicated.
+        // Uninstall the SIGINT interceptor to allow users to abort the possibly very slow recompression step.
+        // This may lead to users unintentionally hit CTRL+C twice, but there is not much to avoid that, other than
+        // setting a timer with some grace perdiod which strikes me as too complicated.
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
-  SetConsoleCtrlHandler(console_event_handler, FALSE);
+        SetConsoleCtrlHandler(console_event_handler, FALSE);
 #else
-  signal(SIGINT, old_handler);
+        signal(SIGINT, old_handler);
 #endif
 
-  wolf.recompress();
+        wolf.recompress();
 
-  if (wolf.out_path)
-    if (wolf.save_file())
-      goto out_error;
+        // Determine an out_path for the output file by simply using the filename of the input file.
+        // This will put the output file(s) in the current working directory.
+        std::string filename;
+        pos = fileQueue.front().find_last_of("/");
+        if (pos != std::string::npos)
+        {
+            filename = executablePath + fileQueue.front().substr(pos + 1);
+        }
+        else
+        {
+            pos = fileQueue.front().find_last_of("\\");
+            if (pos != std::string::npos)
+                filename = executablePath + fileQueue.front().substr(pos + 1);
+            else
+                filename = executablePath + fileQueue.front();
+        }
 
-  if (argBestIdatTo != NULL)
-    if (wolf.save_best_idat(argBestIdatTo))
-      goto out_error;
+        wolf.out_path = filename.c_str();
+        if (wolf.save_file()) // True if an error occurred while saving the file.
+        {
+            fprintf(stderr, "pngwolf: Unable to save output file '%s'", filename.c_str());
+            return EXIT_FAILURE;
+        }
+        wolf.out_path = nullptr;
 
-  wolf.log_summary();
+        if (!argBestIdatTo.empty() && wolf.save_best_idat(argBestIdatTo.c_str()))
+        {
+            fprintf(stderr, "pngwolf: Unable to save best IDAT file '%s'", argBestIdatTo.c_str());
+            return EXIT_FAILURE;
+        }
 
-done:
-  return EXIT_SUCCESS;
+        wolf.log_summary();
 
-error:
-  if (wolf.ihdr.interlace) {
-    fprintf(stderr, "pngwolf: interlaced images are not supported\n");
-    return EXIT_FAILURE;
-  }
+        fileQueue.pop();
+    }
 
-  fprintf(stderr, "pngwolf: an error occured while reading the input file\n");
-  return EXIT_FAILURE;
-
-out_error:
-  fprintf(stderr, "pngwolf: an error occured while writing an output file\n");
-  return EXIT_FAILURE;
-
+    return EXIT_SUCCESS;
 }
 
 // TODO: There are probably integer overflow issues with really,

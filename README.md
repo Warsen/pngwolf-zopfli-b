@@ -1,6 +1,24 @@
 
-pngwolf-zopfli
-==============
+pngwolf-zopfli-b
+================
+
+`pngwolf-zopfli-b` is a modification of `pngwolf-zopfli` to allow
+multiple files to be queued for minimization. The base `pngwolf-zopfli`
+required the user to specify a single file with the `--in=<path.png>`
+option. This modification allows the user to specify any number of
+files as arguments until any option starting with `--` is specified.
+The output file will be placed in the same directory as the executable
+using the same filenames.
+
+This works great on Windows because it allows the user to drag and drop
+files onto the executable where the user likely has write permissions.
+
+***Features In Planning:***
+For other operating systems and users without write permissions, an
+`--out=<path>` option can be used to specify which directory the output
+files should be placed at.
+
+---
 
 `pngwolf-zopfli` is a version of `pngwolf` that uses Zopfli for the
 final compression step.
